@@ -62,6 +62,17 @@ app.get('/api/validate-token', authenticateToken, (req, res) => {
   res.json({ valid: true });
 });
 
+// 新增接口：获取用户表数据
+app.get('/api/users', authenticateToken, async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT id, username, email, created_at, token FROM users');
+    res.json(rows);
+  } catch (error) {
+    console.error('获取用户数据失败:', error);
+    res.status(500).json({ error: '获取用户数据失败' });
+  }
+});
+
 // 注册接口
 app.post('/api/register', async (req, res) => {
   try {
@@ -271,22 +282,26 @@ app.post('/api/iot/unonline', async (req, res) => {
   }
 });
 
+// 消息发布触发(硬件端上报数据、用户web端下发数据)
 app.post('/api/iot/get', async (req, res) => {
   try {
     const { topic, clientid, username, payload } = req.body;
     const receiveTime = new Date();
 
-    if (clientid === '11111111111111111') {
-      return console.log('服务器端下发消息');
-    }
-
     // 数据清洗逻辑
     let rawData = payload;
+    let deviceMAC = null; // 初始化 mac_address，确保作用域覆盖后续逻辑
     
     // 如果是字符串类型才需要处理
     if (typeof rawData === 'string') {
       // 找到第一个JSON开始位置
       const jsonStart = rawData.indexOf('{');
+      // 提取 MAC 地址的逻辑
+      if (jsonStart !== -1) {
+        // 假设 MAC 地址在 JSON 前且被方括号包裹（如 "[AA:BB:CC:DD:EE:FF]{...}"）
+        const macEnd = jsonStart - 1;
+        deviceMAC = rawData.substring(1, macEnd).trim(); // 去掉首尾方括号和空格
+      }
       // 找到最后一个JSON结束位置
       const jsonEnd = rawData.lastIndexOf('}') + 1;
       
@@ -300,15 +315,27 @@ app.post('/api/iot/get', async (req, res) => {
       ? JSON.parse(rawData)
       : rawData;
 
-    // 完整保存有效JSON
-    await pool2.execute(
-      'INSERT INTO gather (time, theme, msg, mac_address) VALUES (?, ?, ?, ?)',
-      [receiveTime, topic, JSON.stringify(payloadData), clientid]
-    );
+    // 根据不同的发布客户端进行存储
+    if (clientid === '11111111111111111') {
+      if (!deviceMAC) {
+        throw new Error('无法提取有效的 MAC 地址');
+      }
 
-    console.log(`数据已保存: ${clientid} - ${topic}`);
-    res.status(200).json({ message: '数据接收成功' });
-    
+      await pool2.execute(
+        'INSERT INTO operate (time, theme, msg, mac_address) VALUES (?, ?, ?, ?)',
+        [receiveTime, topic, JSON.stringify(payloadData), deviceMAC]
+      );
+      console.log(`服务器端操作记录已保存: ${deviceMAC} - ${topic}`);
+      res.status(200).json({ message: '服务器端下发消息' });
+    } else {
+      await pool2.execute(
+        'INSERT INTO gather (time, theme, msg, mac_address) VALUES (?, ?, ?, ?)',
+        [receiveTime, topic, JSON.stringify(payloadData), clientid]
+      );
+
+      console.log(`数据已保存: ${clientid} - ${topic}`);
+      res.status(200).json({ message: '数据接收成功' });
+    }
   } catch (error) {
     console.error('数据处理错误:', error);
     res.status(500).json({ 
@@ -321,34 +348,17 @@ app.post('/api/iot/get', async (req, res) => {
   }
 });
 
-// 消息已投递触发(服务器下发完成触发，验证是否被硬件客户端接收(topic被订阅才会触发))
-app.post('/api/iot/set', async (req, res) => {
-  try {
-    const { from_clientid } = req.body;
-    if(from_clientid === '11111111111111111')
-    {
-    	console.log('测试: ',req.body);
-    	res.status(200).json({ message: '数据接收成功' });
-    }
-    else
-    	return console.log('非服务器下发数据');
-  } catch (error) {
-    console.error('硬件端数据接收错误:', error);
-    res.status(500).json({ error: '数据下发失败' });
-  }
-});
-
-// 获取现有设备的key与对应value
+// 获取已连接服务器的网关设备MAC与其下的子设备key和value
 app.post('/api/iot/get_keyvalue', async (req, res) => {
   try {
     const { userId } = req.body;
-    // 获取用户所有mac地址
+    // 获取用户所有网关mac地址
     const [devices] = await pool2.query(
       'SELECT mac_address FROM devices WHERE id = ?', 
       [userId]
     ); 
     const result = {};
-    // 遍历每个设备
+    // 遍历每个网关
     for (const device of devices) {
       const mac = device.mac_address;
       // 查询最新msg数据
@@ -386,18 +396,18 @@ app.post('/api/iot/get_keyvalue', async (req, res) => {
   }
 });
 
-// 刷新设备信息：保存设备的原始 key
+// 刷新设备信息：将网关下设备原始key保存到device_key，以便用户自定义key别名（device_key已有的不再重复保存）
 app.post('/api/iot/save_keys', authenticateToken , async (req, res) => {
   try {
     const { userId } = req.body;
 
-    // 获取用户所有设备的 MAC 地址
+    // 获取用户所有的网关 MAC 地址
     const [devices] = await pool2.query(
       'SELECT mac_address FROM devices WHERE id = ?',
       [userId]
     );
 
-    // 遍历每个设备
+    // 遍历每个网关
     for (const device of devices) {
       const mac = device.mac_address;
 
@@ -417,7 +427,7 @@ app.post('/api/iot/save_keys', authenticateToken , async (req, res) => {
           const msgObj = JSON.parse(gatherData[0].msg).msg;
           const keys = Object.keys(msgObj);
 
-          // 获取已保存的 key_alias
+          // 获取已保存的设备别名
           const [savedKeys] = await pool2.query(
             'SELECT mac_key, key_alias FROM device_key WHERE mac_address = ?',
             [mac]
@@ -425,7 +435,7 @@ app.post('/api/iot/save_keys', authenticateToken , async (req, res) => {
 
           const savedKeyMap = new Map(savedKeys.map((k) => [k.mac_key, k.key_alias]));
 
-          // 将原始 key 保存到 device_key 表（只添加新的 key）
+          // 将原始 key 保存到 device_key 表（只添加新的 key,如果这个key还没有被保存到device_key中）
           for (const key of keys) {
             if (!savedKeyMap.has(key)) {
               await pool2.execute(
@@ -448,11 +458,12 @@ app.post('/api/iot/save_keys', authenticateToken , async (req, res) => {
   }
 });
 
+// 获取网关设备列表，返回以网关别名为键的对象，返回的对象中包含网关别名、是否在线、最新msg、key别名[原始设备key、设备key别名、设备类型]
 app.get('/api/iot/devices', authenticateToken, async (req, res) => {
   try {
     const userId = req.query.userId;
 
-    // 获取设备列表
+    // 获取网关设备列表
     const [devices] = await pool2.query(
       'SELECT mac_address, mac_alias, is_online FROM devices WHERE id = ?',
       [userId]
@@ -462,7 +473,7 @@ app.get('/api/iot/devices', authenticateToken, async (req, res) => {
 
     // 获取每个设备的key别名及最新msg
     for (const device of devices) {
-      // 获取设备的最新msg
+      // 获取网关最新的msg
       const [latestMsg] = await pool2.query(
         `SELECT msg 
          FROM gather 
@@ -499,7 +510,7 @@ app.get('/api/iot/devices', authenticateToken, async (req, res) => {
   }
 });
 
-// 保存设备别名
+// 设置用户网关设备别名与设备Key别名
 app.post('/api/iot/set_keyvalue', authenticateToken , async (req, res) => {
   try {
     const { mac_address, mac_alias, keys } = req.body;
@@ -526,6 +537,139 @@ app.post('/api/iot/set_keyvalue', authenticateToken , async (req, res) => {
   }
 });
 
+// 删除用户所属网关设备接口
+app.delete('/api/iot/delete-device', authenticateToken, async (req, res) => {
+  try {
+    const { mac_address } = req.body;
+    const userId = req.user.userId;
+
+    // 1. 验证设备是否属于该用户
+    const [device] = await pool2.execute(
+      'SELECT id FROM devices WHERE mac_address = ? AND id = ?',
+      [mac_address, userId]
+    );
+
+    if (device.length === 0) {
+      return res.status(404).json({ 
+        error: '设备不存在或不属于当前用户',
+        code: 'DEVICE_NOT_FOUND'
+      });
+    }
+
+    // 2. 执行删除操作（级联删除由数据库自动处理）
+    const [result] = await pool2.execute(
+      'DELETE FROM devices WHERE mac_address = ?',
+      [mac_address]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(500).json({ 
+        error: '删除设备失败',
+        code: 'DELETE_FAILED'
+      });
+    }
+
+    res.json({ 
+      message: '设备删除成功',
+      deleted_mac: mac_address,
+      affected_records: result.affectedRows
+    });
+
+  } catch (error) {
+    console.error('删除设备错误:', error);
+    res.status(500).json({ 
+      error: '服务器内部错误',
+      code: 'INTERNAL_SERVER_ERROR',
+      details: error.message
+    });
+  }
+});
+
+// 获取数据记录条数接口
+app.post('/api/iot/get_record_count', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    // 查询用户名下所有设备的 MAC 地址
+    const [devices] = await pool2.query(
+      'SELECT mac_address FROM devices WHERE id = ?',
+      [userId]
+    );
+
+    let totalGatherCount = 0;
+    let totalOperateCount = 0;
+
+    // 遍历设备，统计 gather 和 operate 表的记录条数
+    for (const device of devices) {
+      const macAddress = device.mac_address;
+
+      // 查询 gather 表记录条数
+      const [gatherCountResult] = await pool2.query(
+        'SELECT COUNT(*) AS count FROM gather WHERE mac_address = ?',
+        [macAddress]
+      );
+      totalGatherCount += gatherCountResult[0].count;
+
+      // 查询 operate 表记录条数
+      const [operateCountResult] = await pool2.query(
+        'SELECT COUNT(*) AS count FROM operate WHERE mac_address = ?',
+        [macAddress]
+      );
+      totalOperateCount += operateCountResult[0].count;
+    }
+
+    res.json({
+      userId,
+      total_gather_count: totalGatherCount,
+      total_operate_count: totalOperateCount,
+    });
+  } catch (error) {
+    console.error('获取记录条数失败:', error);
+    res.status(500).json({ error: '获取记录条数失败' });
+  }
+});
+
+// 根据 MAC 地址获取网关的 msg 信息
+app.post('/api/iot/get_mac_data', authenticateToken, async (req, res) => {
+  try {
+    const { mac_address } = req.body;
+
+    // 查询指定 MAC 地址的所有 msg 数据及其对应时间
+    const [rows] = await pool2.query(
+      `SELECT time, msg 
+       FROM gather 
+       WHERE mac_address = ? 
+       ORDER BY time DESC`,
+      [mac_address]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: '未找到相关数据' });
+    }
+
+    const result = {};
+
+    // 遍历每条记录，解析 msg 并提取 key-value
+    rows.forEach(({ time, msg }) => {
+      try {
+        const msgObj = JSON.parse(msg).msg;
+        for (const [key, value] of Object.entries(msgObj)) {
+          if (!result[key]) {
+            result[key] = [];
+          }
+          result[key].push({ value, time });
+        }
+      } catch (error) {
+        console.error(`解析 msg 失败: ${msg}`, error);
+      }
+    });
+
+    res.json({ mac_address, data: result });
+  } catch (error) {
+    console.error('获取网关数据失败:', error);
+    res.status(500).json({ error: '获取网关数据失败' });
+  }
+});
 
 app.listen(process.env.PORT, () => {
   console.log(`Server running on port ${process.env.PORT}`);
